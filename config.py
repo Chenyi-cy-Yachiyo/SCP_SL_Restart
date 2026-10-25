@@ -26,6 +26,8 @@ DEFAULTS = {
     "show_timer": True,         # 回合时长计时器总开关（托盘菜单可切）
     "timer_color": "#FFD400",   # 时长超阈值后的字色（黄）
     "timer_yellow_after": 1200,  # 时长多少秒后转黄（20 分钟）
+    "round_min_players": 2,     # 达到此人数后才开始估算开局倒计时
+    "round_start_delay": 45,    # 开局倒计时估算秒数，可在提醒设置修改
     "counter_pos": [10, 10],    # 人数条位置
     "restart_pos": [10, 48],    # 重启提示位置（让开人数条）
     "counter_font": 16,         # 人数条字号
@@ -118,6 +120,11 @@ def load():
         cfg["sound_volume"] = max(0, min(100, int(cfg["sound_volume"])))
     except (TypeError, ValueError, OverflowError):
         cfg["sound_volume"] = DEFAULTS["sound_volume"]
+    for key, low, high in (("round_min_players", 1, 100), ("round_start_delay", 0, 300)):
+        try:
+            cfg[key] = max(low, min(high, int(cfg[key])))
+        except (TypeError, ValueError, OverflowError):
+            cfg[key] = DEFAULTS[key]
     return cfg
 
 

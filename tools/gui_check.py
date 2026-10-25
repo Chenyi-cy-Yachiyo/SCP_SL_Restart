@@ -145,11 +145,12 @@ def main():
                            {"addr": "2.2.2.2:7779", "name": "3服", "timer": True}]
     ui.monitor._players = {"1.1.1.1:7777": 40, "2.2.2.2:7779": 2}
     ui.monitor._timer = {"1.1.1.1:7777": 1260.0, "2.2.2.2:7779": 120.0}
+    ui.monitor._round_phase = {"1.1.1.1:7777": "running", "2.2.2.2:7779": "running"}
     ui.monitor._show_timer = True
     ui.monitor.snapshot = ui.monitor._make_snapshot()
     ui._draw_counter(ui.monitor.snapshot)
     check("人数条上带回合时长（M:SS），跟在人数后面",
-          ui.counter.text == "[1服] 40人 21:00  |  [3服] 2人 2:00", ui.counter.text)
+          ui.counter.text == "[1服] 40人 ≈21:00  |  [3服] 2人 ≈2:00", ui.counter.text)
     cols = [c.name() if c else None for _, c in ui.counter.lines[0]]
     check("超过 20 分钟的时长变黄、没超的保持白色",
           cols.count("#ffd400") == 1 and cols.count(None) >= 3, cols)

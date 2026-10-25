@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSlider, QVBoxLayout)
+                               QPushButton, QSlider, QSpinBox, QVBoxLayout)
 
 from alerts import RestartAlerts
 
@@ -64,6 +64,19 @@ class AlertDialog(QDialog):
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
+        self.round_min_players = QSpinBox()
+        self.round_min_players.setRange(1, 100)
+        self.round_min_players.setValue(cfg.get("round_min_players", 2))
+        self.round_start_delay = QSpinBox()
+        self.round_start_delay.setRange(0, 300)
+        self.round_start_delay.setSuffix(" 秒")
+        self.round_start_delay.setValue(cfg.get("round_start_delay", 45))
+        timing = QHBoxLayout()
+        timing.addWidget(QLabel("开局估算：至少"))
+        timing.addWidget(self.round_min_players)
+        timing.addWidget(QLabel("人，等待"))
+        timing.addWidget(self.round_start_delay)
+        timing.addStretch(1)
         self._preview.status.connect(self.status_label.setText)
         if self._notifier is not self._preview:
             self._notifier.status.connect(self.status_label.setText)
@@ -82,6 +95,11 @@ class AlertDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addLayout(notifications)
+        layout.addLayout(timing)
+        timing_hint = QLabel("时长为本地估算（≈），无法从人数查询获取真实回合状态。\n"
+                            "修改估算参数后重新计时；中途打开程序不能还原已进行的回合。")
+        timing_hint.setWordWrap(True)
+        layout.addWidget(timing_hint)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
         layout.addWidget(box)
@@ -105,7 +123,9 @@ class AlertDialog(QDialog):
         return {"sound_enabled": self.sound_enabled.isChecked(),
                 "sound_file": self.sound_file.text(),
                 "sound_volume": self.volume.value(),
-                "windows_notifications": self.notifications_enabled.isChecked()}
+                "windows_notifications": self.notifications_enabled.isChecked(),
+                "round_min_players": self.round_min_players.value(),
+                "round_start_delay": self.round_start_delay.value()}
 
     def accept(self):
         if self.sound_enabled.isChecked() and self.sound_file.text() \

@@ -28,6 +28,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name "SL Restart" ^
   --icon assets\app.ico ^
   --version-file tools\version_info.txt ^
+  --collect-submodules winrt.windows.foundation ^
   sl_restart.py
 if errorlevel 1 goto :fail
 

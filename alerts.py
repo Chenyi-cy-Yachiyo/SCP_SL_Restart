@@ -1,20 +1,11 @@
 # -*- coding: utf-8 -*-
-"""重启提醒：异步音频播放和 Windows 原生通知，不阻塞界面或采集。
+"""重启提醒：Qt 音频和进程内 WinRT 通知。
 
-Windows 通知与 scpsl_auto_player 的 toast_actions 同一套思路，**避免被杀软拦截**：
-* PowerShell 脚本是一段**固定不变**的静态文本——启动参数（含 EncodedCommand）
-  每次完全相同，杀软的启发式认得出这是良性固定行为；
-  标题/正文拼成 toast XML 后走**环境变量**传入，绝不拼进脚本代码；
-* 后台线程用 subprocess 启动，带 CREATE_NO_WINDOW，绝不闪黑窗；
-* 通知显示名/图标用 winreg 写一条 HKCU 的 AppUserModelId（失败也不影响发送）；
-* 只有 PowerShell 真正接受了请求（输出成功标记）才说成功，
-  被系统屏蔽（专注助手/全屏）会给出对应的失败原因。
+通知由后台线程直接调用 Windows Runtime；不启动脚本、命令解释器或子进程。
+身份及进服协议仍使用当前用户注册表，声音与进服按钮保持原行为。
 """
 
-import base64
 import os
-import shutil
-import subprocess
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -26,8 +17,6 @@ from PySide6.QtWidgets import QApplication
 import config
 
 NOTIFICATION_APP_ID = "ByDiamond.SLRestart"
-NOTIFICATION_TIMEOUT_S = 15
-CREATE_NO_WINDOW = 0x08000000
 MAX_INFLIGHT_NOTIFICATIONS = 6
 JOIN_PROTOCOL = "slrestart"                  # 通知按钮的协议：slrestart://join/IP:端口
 JOIN_URL_PREFIX = JOIN_PROTOCOL + "://join/"
@@ -55,7 +44,7 @@ def build_toast_xml(title, message, join_url=""):
     toast = ET.Element("toast", duration="short")
     if join_url:
         toast.set("activationType", "protocol")
-        toast.set("activation", join_url)
+        toast.set("launch", join_url)
     binding = ET.SubElement(ET.SubElement(toast, "visual"), "binding", template="ToastGeneric")
     ET.SubElement(binding, "text").text = str(title)
     ET.SubElement(binding, "text").text = str(message)
@@ -69,48 +58,33 @@ def build_toast_xml(title, message, join_url=""):
 
 # ----------------------------- 发给系统 -----------------------------
 
-PS_SCRIPT = r"""
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
-[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
-$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-$xml.LoadXml($env:OPB_XML)
-$toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-$toast.Tag = 'restart'
-$toast.Group = 'servers'
-$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:OPB_AUMID)
-$setting = [string]$notifier.Setting
-if ($setting -and $setting -ne 'Enabled') {
-    Write-Output ('SL_RESTART_NOTIFICATION_BLOCKED:' + $setting)
-    exit 2
-}
-$notifier.Show($toast)
-Write-Output 'SL_RESTART_NOTIFICATION_SENT'
-"""
-
-_POWERSHELL_ARGS = ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-                    "-EncodedCommand",
-                    base64.b64encode(PS_SCRIPT.encode("utf-16-le")).decode("ascii")]
-
-
-def notification_command():
-    """固定的 PowerShell 启动参数（脚本静态、数据走环境变量）。"""
-    return list(_POWERSHELL_ARGS)
-
-
-def _powershell_exe():
-    """系统自带 PowerShell 的真实路径（找不到就让系统按 PATH 找）。"""
-    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
-    for candidate in (os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-                      os.path.join(root, "SysWOW64", "WindowsPowerShell", "v1.0", "powershell.exe")):
-        if os.path.isfile(candidate):
-            return candidate
+def send_native_toast(xml):
+    """每个通知线程独立初始化 WinRT，所有退出路径均释放 apartment。"""
+    from winrt.runtime import ApartmentType, init_apartment, uninit_apartment
+    init_apartment(ApartmentType.MULTI_THREADED)
     try:
-        return shutil.which("powershell.exe") or shutil.which("pwsh.exe") or "powershell.exe"
-    except Exception:
-        return "powershell.exe"
+        return _show_native_toast(xml)
+    finally:
+        uninit_apartment()
+
+
+def _show_native_toast(xml):
+    from winrt.windows.data.xml.dom import XmlDocument
+    from winrt.windows.ui.notifications import (NotificationSetting, ToastNotification,
+                                               ToastNotificationManager)
+    document = XmlDocument()
+    document.load_xml(xml)
+    toast = ToastNotification(document)
+    toast.group = "servers"
+    # 不同服务器各保留一条通知；同一台服务器的新通知更新原条目。
+    import hashlib
+    toast.tag = hashlib.sha256(xml.encode("utf-8")).hexdigest()[:16]
+    notifier = ToastNotificationManager.create_toast_notifier_with_id(NOTIFICATION_APP_ID)
+    setting = notifier.setting
+    if setting != NotificationSetting.ENABLED:
+        return setting.name
+    notifier.show(toast)
+    return "ENABLED"
 
 
 def register_notification_identity():
@@ -217,11 +191,7 @@ class RestartAlerts(QObject):
         if sys.platform != "win32":
             self.status.emit("Windows 通知仅支持 Windows 10/11。")
             return
-        executable = _powershell_exe()
-        if not os.path.isfile(executable):
-            config.log("[alerts] 找不到 Windows PowerShell")
-            self.status.emit("找不到 Windows PowerShell，无法发送系统通知。")
-            return
+        self._threads = [thread for thread in self._threads if thread.is_alive()]
         if sum(1 for t in self._threads if t.is_alive()) >= MAX_INFLIGHT_NOTIFICATIONS:
             config.log("[alerts] 系统通知仍在发送，跳过本次通知")
             return
@@ -233,49 +203,32 @@ class RestartAlerts(QObject):
             self._identity_registered = True
         xml = build_toast_xml(title, message, join_url)
         thread = threading.Thread(target=self._send_notification,
-                                  args=(executable, xml), daemon=True,
+                                  args=(xml,), daemon=True,
                                   name="sl-restart-notification")
         self._threads.append(thread)
         config.log("[alerts] 请求 Windows 通知：%s" % title)
         thread.start()
 
-    def _send_notification(self, executable, xml):
-        """后台线程：跑固定脚本发通知，数据走环境变量。"""
+    def _send_notification(self, xml):
+        """直接调用 WinRT，状态通过 Qt 信号交给 UI 线程。"""
         try:
-            result = subprocess.run(
-                [executable] + notification_command(),
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                env={**os.environ, "OPB_XML": xml, "OPB_AUMID": NOTIFICATION_APP_ID},
-                timeout=NOTIFICATION_TIMEOUT_S,
-                creationflags=CREATE_NO_WINDOW)      # noqa: S603
-        except subprocess.TimeoutExpired:
-            config.log("[alerts] Windows 通知发送超时")
-            self.status.emit("Windows 通知发送超时。")
-            return
+            setting = send_native_toast(xml)
         except Exception as e:
-            config.log("[alerts] Windows 通知进程失败：%r" % e)
+            config.log("[alerts] 原生 Windows 通知失败：%r" % e)
             self.status.emit("Windows 通知发送失败，请查看运行日志。")
             return
-        self._report_notification_result(
-            result.returncode, (result.stdout or ""), (result.stderr or ""))
-
-    def _report_notification_result(self, returncode, out, err):
-        """核对 PowerShell 的返回，如实上报（不谎报成功）。在后台线程里被调用。"""
-        details = (out or "") + "\n" + (err or "")
-        if returncode == 0 and "SL_RESTART_NOTIFICATION_SENT" in details:
-            config.log("[alerts] Windows 已接受通知请求（不代表横幅已显示）")
+        if setting == "ENABLED":
+            config.log("[alerts] Windows 已接受原生通知请求（不代表横幅已显示）")
             self.status.emit("通知已提交 Windows；显示方式由系统通知设置控制。")
             return
-        config.log("[alerts] Windows 通知失败（%s）：%s" % (returncode, details.strip()[:2000]))
         reasons = {
-            "DisabledForApplication": "Windows 已关闭此应用的通知，请在系统通知设置中开启 SL Restart。",
-            "DisabledForUser": "Windows 已关闭当前用户的通知，请检查系统通知设置。",
-            "DisabledByGroupPolicy": "Windows 通知被系统策略禁用。",
-            "DisabledByManifest": "Windows 未识别应用的通知身份，请查看运行日志。",
+            "DISABLED_FOR_APPLICATION": "Windows 已关闭此应用的通知，请在系统通知设置中开启 SL Restart。",
+            "DISABLED_FOR_USER": "Windows 已关闭当前用户的通知，请检查系统通知设置。",
+            "DISABLED_BY_GROUP_POLICY": "Windows 通知被系统策略禁用。",
+            "DISABLED_BY_MANIFEST": "Windows 未识别应用的通知身份，请查看运行日志。",
         }
-        reason = next((text for setting, text in reasons.items() if setting in details),
-                      "Windows 通知发送失败，请查看运行日志。")
-        self.status.emit(reason)
+        config.log("[alerts] Windows 通知被禁用：%s" % setting)
+        self.status.emit(reasons.get(setting, "Windows 通知不可用，请检查系统通知设置。"))
 
     def stop(self):
         self.stop_sound()

@@ -181,6 +181,7 @@ def test_config_roundtrip(tmp):
 def test_monitor_round(tmp):
     config.set_base_dir(tmp)
     cfg = config.load()
+    cfg.update(round_min_players=1, round_start_delay=0)
     cfg["servers"] = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True},
                       {"addr": "1.1.1.1:7779", "name": "3服", "timer": True}]
     clock = Clock()
@@ -191,34 +192,34 @@ def test_monitor_round(tmp):
         m = Monitor(cfg)
         m._clock = clock
         m._round()                       # 7777 通(41)；7779 第 1 次失败 -> 先不动
-        assert m.snapshot["text"] == "[1服] 41人 0:00  |  [3服] -人", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 41人 ≈0:00  |  [3服] -人", m.snapshot["text"]
         assert m.snapshot["online"] == 1
         assert m.take_restarts() == []
 
         clock.tick()
         m._round()                       # 7779 第 2 次失败 -> 判离线（从没上线过，不记事件）
-        assert m.snapshot["text"] == "[1服] 41人 0:01  |  [3服] -人", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 41人 ≈0:01  |  [3服] -人", m.snapshot["text"]
         events = read("events.log")
         assert "离线" not in events, events
 
         clock.tick()
         m._round()                       # 7779 上线 5 人
-        assert m.snapshot["text"] == "[1服] 41人 0:02  |  [3服] 5人 0:01", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 41人 ≈0:02  |  [3服] 5人 ≈0:01", m.snapshot["text"]
         events = read("events.log")
         assert "上线 5/45" in events, events
 
         clock.tick()
         m._round()                       # 7777 归零 -> 重启，时长清零
         assert m.take_restarts() == [("1服", "1.1.1.1:7777")], m.snapshot
-        assert m.snapshot["text"] == "[1服] 0人  |  [3服] 5人 0:02", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 0人  |  [3服] 5人 ≈0:02", m.snapshot["text"]
 
         clock.tick()
         m._round()                       # 持续 0：不重复报，1服 也不计时
         assert m.take_restarts() == []
-        assert m.snapshot["text"] == "[1服] 0人  |  [3服] 5人 0:03", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 0人  |  [3服] 5人 ≈0:03", m.snapshot["text"]
 
         # 时长那一段是独立分段，UI 才好单独上色
-        assert (" 0:03", None) in m.snapshot["segments"], m.snapshot["segments"]
+        assert (" ≈0:03", None) in m.snapshot["segments"], m.snapshot["segments"]
 
         csv_text = open(config.path("history.csv"), encoding="utf-8-sig").read().strip().splitlines()
         assert csv_text[0] == "time,address,name,players,max", csv_text[0]
@@ -241,6 +242,7 @@ def test_monitor_round(tmp):
     os.makedirs(off_dir, exist_ok=True)
     config.set_base_dir(off_dir)
     cfg2 = config.load()
+    cfg2.update(round_min_players=1, round_start_delay=0)
     cfg2["servers"] = [{"addr": "9.9.9.9:7777", "name": "9服", "timer": True}]
     clock2 = Clock()
     fake_off = FakeA2S({"9.9.9.9:7777": [info(7), None, None]})
@@ -249,11 +251,11 @@ def test_monitor_round(tmp):
         m2 = Monitor(cfg2)
         m2._clock = clock2
         m2._round()
-        assert m2.snapshot["text"] == "[9服] 7人 0:00", m2.snapshot["text"]
+        assert m2.snapshot["text"] == "[9服] 7人 ≈0:00", m2.snapshot["text"]
 
         clock2.tick()
         m2._round()                      # 第 1 次失败：显示不动、不误报、不计时
-        assert m2.snapshot["text"] == "[9服] 7人 0:00", m2.snapshot["text"]
+        assert m2.snapshot["text"] == "[9服] 7人 ≈0:00", m2.snapshot["text"]
         assert m2.take_restarts() == []
 
         clock2.tick()
@@ -274,6 +276,7 @@ def test_timer_switch(tmp):
     os.makedirs(dir_, exist_ok=True)
     config.set_base_dir(dir_)
     cfg = config.load()
+    cfg.update(round_min_players=1, round_start_delay=0)
     cfg["servers"] = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True},
                       {"addr": "1.1.1.1:7779", "name": "3服", "timer": False}]
     old, a2s.query = a2s.query, FakeA2S({"1.1.1.1:7777": [info(10)],
@@ -282,12 +285,12 @@ def test_timer_switch(tmp):
         m = Monitor(cfg)
         m._clock = Clock()
         m._round()
-        assert m.snapshot["text"] == "[1服] 10人 0:00  |  [3服] 20人", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 10人 ≈0:00  |  [3服] 20人", m.snapshot["text"]
 
         m.set_show_timer(False)          # 总开关关掉：两台都不带时长了
         assert m.snapshot["text"] == "[1服] 10人  |  [3服] 20人", m.snapshot["text"]
         m.set_show_timer(True)           # 打开：按每台服自己的勾选
-        assert m.snapshot["text"] == "[1服] 10人 0:00  |  [3服] 20人", m.snapshot["text"]
+        assert m.snapshot["text"] == "[1服] 10人 ≈0:00  |  [3服] 20人", m.snapshot["text"]
     finally:
         a2s.query = old
 

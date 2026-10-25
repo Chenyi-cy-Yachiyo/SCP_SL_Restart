@@ -1,1 +1,6 @@
 PySide6>=6.5
+winrt-runtime==3.2.1; sys_platform == "win32"
+winrt-Windows.UI.Notifications==3.2.1; sys_platform == "win32"
+winrt-Windows.Data.Xml.Dom==3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation==3.2.1; sys_platform == "win32"
+winrt-Windows.Foundation.Collections==3.2.1; sys_platform == "win32"

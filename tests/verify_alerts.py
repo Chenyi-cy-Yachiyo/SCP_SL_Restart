@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """离屏提醒测试：不播放声音，不发送系统通知，不联网。"""
 
-import base64
+import ast
+import inspect
 import os
 import sys
 import tempfile
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import QApplication
 
 import config
 from alerts import (NOTIFICATION_APP_ID, RestartAlerts, build_toast_xml,
-                    notification_command, register_notification_identity)
+                    register_notification_identity, send_native_toast)
 from alert_dialog import AlertDialog
 from sl_restart import App
 
@@ -83,23 +84,20 @@ class AlertTests(unittest.TestCase):
             self.assertEqual(second.args[1], "[3服] 重启")
             self.assertEqual(second.kwargs["join_url"], "slrestart://join/1.1.1.1:7779")
 
-    def test_notification_xml_escape_and_static_command(self):
+    def test_notification_xml_escape_and_no_script(self):
         title = "SCP:SL 重启"
         message = "[<服&名>] ' ; $(calc)\n新一行"
         xml = build_toast_xml(title, message)
         root = ET.fromstring(xml)
         self.assertEqual([e.text for e in root.findall("./visual/binding/text")], [title, message])
         self.assertEqual(root.find("audio").attrib["silent"], "true")
-        # 脚本静态：启动参数（含 EncodedCommand）每次完全相同，数据走环境变量
-        args = notification_command()
-        self.assertEqual(notification_command(), args)
-        self.assertNotIn("-Command", args)
-        self.assertIn("-EncodedCommand", args)
-        script = base64.b64decode(args[-1]).decode("utf-16-le")
-        self.assertNotIn(message, script)
-        self.assertNotIn(title, script)
-        self.assertIn("$xml.LoadXml($env:OPB_XML)", script)
-        self.assertIn("CreateToastNotifier($env:OPB_AUMID)", script)
+        import alerts
+        tree = ast.parse(inspect.getsource(alerts))
+        imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+        modules = [getattr(node, "module", "") or "" for node in imports]
+        modules += [alias.name for node in imports if isinstance(node, ast.Import) for alias in node.names]
+        self.assertNotIn("subprocess", modules)
+        self.assertFalse(hasattr(alerts, "PS_SCRIPT"))
         self.assertNotIn(" ", NOTIFICATION_APP_ID)
         self.assertLessEqual(len(NOTIFICATION_APP_ID), 128)
 
@@ -107,7 +105,7 @@ class AlertTests(unittest.TestCase):
         url = "slrestart://join/1.2.3.4:7777"
         root = ET.fromstring(build_toast_xml("[3服] 重启", "内容", url))
         self.assertEqual(root.attrib["activationType"], "protocol")
-        self.assertEqual(root.attrib["activation"], url)      # 点通知本体 = 进服
+        self.assertEqual(root.attrib["launch"], url)      # 点通知本体 = 进服
         action = root.find("./actions/action")
         self.assertEqual(action.attrib["content"], "进服")
         self.assertEqual(action.attrib["arguments"], url)     # 点按钮 = 进服那一台
@@ -140,12 +138,36 @@ class AlertTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             join.assert_not_called()
 
-    def test_script_checks_setting_before_showing(self):
-        script = base64.b64decode(notification_command()[-1]).decode("utf-16-le")
-        self.assertIn("$notifier.Setting", script)
-        self.assertIn("if ($setting -and $setting -ne 'Enabled')", script)
-        self.assertNotIn("$notifier.Setting.ToString()", script)
-        self.assertNotIn("-Name DisplayName", script)   # 注册表改由 winreg 写，脚本不再碰
+    def test_native_runtime_initialization_and_cleanup(self):
+        with patch("winrt.runtime.init_apartment") as initialize, \
+                patch("winrt.runtime.uninit_apartment") as release, \
+                patch("alerts._show_native_toast", return_value="ENABLED") as show:
+            self.assertEqual(send_native_toast("<toast/>"), "ENABLED")
+            initialize.assert_called_once()
+            show.assert_called_once_with("<toast/>")
+            release.assert_called_once()
+        with patch("winrt.runtime.init_apartment"), patch("winrt.runtime.uninit_apartment") as release, \
+                patch("alerts._show_native_toast", side_effect=OSError("native failure")):
+            with self.assertRaises(OSError):
+                send_native_toast("<toast/>")
+            release.assert_called_once()
+
+    def test_native_api_uses_xml_and_respects_disabled_setting(self):
+        from alerts import _show_native_toast
+        from winrt.windows.ui.notifications import NotificationSetting
+        with patch("winrt.windows.data.xml.dom.XmlDocument") as document, \
+                patch("winrt.windows.ui.notifications.ToastNotification") as toast, \
+                patch("winrt.windows.ui.notifications.ToastNotificationManager") as manager:
+            notifier = manager.create_toast_notifier_with_id.return_value
+            notifier.setting = NotificationSetting.ENABLED
+            self.assertEqual(_show_native_toast("<toast/>"), "ENABLED")
+            document.return_value.load_xml.assert_called_once_with("<toast/>")
+            manager.create_toast_notifier_with_id.assert_called_once_with(NOTIFICATION_APP_ID)
+            notifier.show.assert_called_once_with(toast.return_value)
+            notifier.show.reset_mock()
+            notifier.setting = NotificationSetting.DISABLED_FOR_APPLICATION
+            self.assertEqual(_show_native_toast("<toast/>"), "DISABLED_FOR_APPLICATION")
+            notifier.show.assert_not_called()
 
     def test_aumid_written_via_winreg_with_display_name(self):
         import winreg
@@ -162,39 +184,29 @@ class AlertTests(unittest.TestCase):
     def test_blocked_notification_reports_blocked_instead_of_success(self):
         messages = []
         self.alerts.status.connect(messages.append)
-        self.alerts._report_notification_result(
-            2, "SL_RESTART_NOTIFICATION_BLOCKED:DisabledForApplication", "")
+        with patch("alerts.send_native_toast", return_value="DISABLED_FOR_APPLICATION"):
+            self.alerts._send_notification("<toast/>")
         self.assertIn("Windows 已关闭此应用的通知", messages[-1])
 
     def test_notification_uses_worker_thread_and_cleans_up(self):
         with patch("alerts.sys.platform", "win32"), \
-                patch("alerts._powershell_exe", return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
-                patch("alerts.subprocess.run") as run, \
+                patch("alerts.send_native_toast", return_value="ENABLED") as send, \
                 patch("alerts.register_notification_identity") as register:
-            run.return_value = Mock(returncode=0,
-                                    stdout="SL_RESTART_NOTIFICATION_SENT", stderr="")
             self.alerts.show_notification("标题", "内容")
             register.assert_called_once()
             self.alerts.stop()                       # join 后台线程后再断言
-            self.assertTrue(run.called)
-            kwargs = run.call_args.kwargs
-            self.assertEqual(kwargs["creationflags"], 0x08000000)   # CREATE_NO_WINDOW，不闪黑窗
-            self.assertEqual(kwargs["env"]["OPB_AUMID"], NOTIFICATION_APP_ID)
-            self.assertIn("标题", kwargs["env"]["OPB_XML"])          # 数据走环境变量，不进脚本
+            send.assert_called_once()
+            self.assertIn("标题", send.call_args.args[0])
             self.assertFalse([t for t in self.alerts._threads if t.is_alive()])
 
     def test_aumid_failure_does_not_block_sending(self):
-        messages = []
-        self.alerts.status.connect(messages.append)
         with patch("alerts.sys.platform", "win32"), \
-                patch("alerts._powershell_exe", return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
-                patch("alerts.subprocess.run") as run, \
+                patch("alerts.send_native_toast", return_value="ENABLED") as send, \
                 patch("alerts.register_notification_identity", side_effect=OSError("access denied")):
-            run.return_value = Mock(returncode=0,
-                                    stdout="SL_RESTART_NOTIFICATION_SENT", stderr="")
             self.alerts.show_notification("标题", "内容")
             self.alerts.stop()
-            run.assert_called_once()                 # 注册失败只记日志，照样发通知
+            send.assert_called_once()                 # 注册失败只记日志，照样发通知
+
 
     def test_settings_cancel_does_not_save(self):
         with patch("sl_restart.Monitor.start"), patch("sl_restart.Tray.show"), \
@@ -255,7 +267,7 @@ class AlertTests(unittest.TestCase):
         dlg.accept()
         self.assertEqual(dlg.result_settings(), {
             "sound_enabled": True, "sound_file": "", "sound_volume": 31,
-            "windows_notifications": True})
+            "windows_notifications": True, "round_min_players": 2, "round_start_delay": 45})
 
     def test_dialog_browse_preview_and_notification_test(self):
         dlg = AlertDialog(self.cfg, self.alerts)
@@ -291,12 +303,18 @@ class AlertTests(unittest.TestCase):
                 self.widgets.append(dlg)
                 dlg.sound_enabled.setChecked(True)
                 dlg.volume.setValue(23)
+                dlg.round_min_players.setValue(3)
+                dlg.round_start_delay.setValue(20)
                 dlg.accept()
                 return dlg.result()
-            with patch.object(AlertDialog, "exec", finish):
+            with patch.object(AlertDialog, "exec", finish), \
+                    patch.object(ui.monitor, "reset_round_timers") as reset:
                 ui.tray.acts["alerts"].trigger()
+                reset.assert_called_once()
             self.assertTrue(config.load()["sound_enabled"])
             self.assertEqual(config.load()["sound_volume"], 23)
+            self.assertEqual(config.load()["round_min_players"], 3)
+            self.assertEqual(config.load()["round_start_delay"], 20)
         finally:
             ui.monitor.stop()
             ui.alerts.stop()

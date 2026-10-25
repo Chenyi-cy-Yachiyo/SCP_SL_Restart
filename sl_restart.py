@@ -146,6 +146,8 @@ class App:
         if dlg.exec() != AlertDialog.DialogCode.Accepted:
             return
         updated = dict(self.cfg, **dlg.result_settings())
+        timing_changed = any(updated.get(key) != self.cfg.get(key)
+                             for key in ("round_min_players", "round_start_delay"))
         try:
             config.save(updated)
         except Exception as e:
@@ -153,6 +155,9 @@ class App:
             QMessageBox.warning(None, "保存失败", "提醒设置未保存，请检查程序目录是否可写。")
             return
         self.cfg.update(dlg.result_settings())
+        if timing_changed:
+            self.monitor.reset_round_timers()
+            self._draw_counter(self.monitor.snapshot, ensure_shown=False)
         if not self.cfg["sound_enabled"]:
             self.alerts.stop_sound()
 
@@ -265,6 +270,8 @@ def main(argv=None):
                     help="开发用：把关于窗口画成 PNG 后退出（验证打包后可用）")
     ap.add_argument("--alerts-grab", metavar="PNG", default="",
                     help="开发用：把提醒设置画成 PNG 后退出（不播放声音或发送通知）")
+    ap.add_argument("--notification-smoke", action="store_true",
+                    help="开发用：发送一条原生测试通知并退出，验证打包依赖")
     ap.add_argument("--instance", default="SL_Restart_instance",
                     help="开发用：单实例锁的名字（并行测试时不撞车）")
     args = ap.parse_args(argv)
@@ -274,6 +281,19 @@ def main(argv=None):
     app.setApplicationName("SL Restart")
     app.setApplicationVersion(config.VERSION)
     app.setQuitOnLastWindowClosed(False)
+
+    if args.notification_smoke:
+        notifier = RestartAlerts(app)
+        def finish_notification_check(message):
+            config.log("[smoke] 原生通知：%s" % message)
+            app.exit(0 if message.startswith("通知已提交") else 2)
+        notifier.status.connect(finish_notification_check)
+        notifier.show_notification("SL Restart · 原生通知验证",
+                                   "本通知通过 WinRT 在程序内发送，不启动 PowerShell。")
+        QTimer.singleShot(15000, lambda: app.exit(3))
+        result = app.exec()
+        notifier.stop()
+        return result
 
     if args.alerts_grab:
         return 0 if AlertDialog(cfg).grab().save(args.alerts_grab) else 1
